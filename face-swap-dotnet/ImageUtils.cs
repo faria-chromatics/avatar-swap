@@ -2,7 +2,7 @@ using OpenCvSharp;
 
 namespace FaceSwap;
 
-/// <summary>Shared utilities: face alignment, blending, color transfer.</summary>
+/// <summary>Shared utilities: face alignment, blending, transforms.</summary>
 public static class ImageUtils
 {
     /// <summary>Align a face to target size using 5-point landmarks and a template.</summary>
@@ -12,21 +12,10 @@ public static class ImageUtils
         return aligned;
     }
 
-    /// <summary>Align a face and return both the aligned image and the affine matrix.</summary>
+    /// <summary>Align a face and return both the aligned image and the affine matrix (Umeyama similarity transform).</summary>
     public static (Mat aligned, Mat M) AlignFaceWithMatrix(Mat image, float[,] landmarks, int size, float[,] template)
     {
-        var srcPts = new Point2f[5];
-        var dstPts = new Point2f[5];
-        for (int i = 0; i < 5; i++)
-        {
-            srcPts[i] = new Point2f(landmarks[i, 0], landmarks[i, 1]);
-            dstPts[i] = new Point2f(template[i, 0], template[i, 1]);
-        }
-
-        // Use estimateAffinePartial2D for similarity transform (rotation + scale + translation)
-        var srcMat = InputArray.Create(srcPts);
-        var dstMat = InputArray.Create(dstPts);
-        var M = Cv2.EstimateAffinePartial2D(srcMat, dstMat);
+        var M = EstimateSimilarityTransform(landmarks, template);
 
         var aligned = new Mat();
         Cv2.WarpAffine(image, aligned, M, new Size(size, size), InterpolationFlags.Linear);
@@ -34,36 +23,150 @@ public static class ImageUtils
         return (aligned, M);
     }
 
-    /// <summary>Paste a face back onto the original image using inverse affine transform (hard paste).</summary>
-    public static void PasteBack(Mat original, Mat face, Mat M, int faceSize)
+    /// <summary>
+    /// Umeyama similarity transform — proper 5-point alignment with
+    /// rotation, uniform scale, and translation (no shear).
+    /// </summary>
+    public static Mat EstimateSimilarityTransform(float[,] srcPts, float[,] dstPts)
     {
-        var MInv = new Mat();
-        Cv2.InvertAffineTransform(M, MInv);
+        int num = srcPts.GetLength(0);
 
-        int h = original.Rows, w = original.Cols;
-        var warped = new Mat();
-        Cv2.WarpAffine(face, warped, MInv, new Size(w, h), InterpolationFlags.Linear);
+        // Compute means
+        double srcMeanX = 0, srcMeanY = 0, dstMeanX = 0, dstMeanY = 0;
+        for (int i = 0; i < num; i++)
+        {
+            srcMeanX += srcPts[i, 0]; srcMeanY += srcPts[i, 1];
+            dstMeanX += dstPts[i, 0]; dstMeanY += dstPts[i, 1];
+        }
+        srcMeanX /= num; srcMeanY /= num;
+        dstMeanX /= num; dstMeanY /= num;
 
-        // Create mask and warp it
-        var mask = new Mat(faceSize, faceSize, MatType.CV_8UC1, new Scalar(255));
-        var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(7, 7));
-        Cv2.Erode(mask, mask, kernel, iterations: 3);
-        Cv2.GaussianBlur(mask, mask, new Size(21, 21), 11);
+        // Demean
+        var srcDX = new double[num]; var srcDY = new double[num];
+        var dstDX = new double[num]; var dstDY = new double[num];
+        for (int i = 0; i < num; i++)
+        {
+            srcDX[i] = srcPts[i, 0] - srcMeanX;
+            srcDY[i] = srcPts[i, 1] - srcMeanY;
+            dstDX[i] = dstPts[i, 0] - dstMeanX;
+            dstDY[i] = dstPts[i, 1] - dstMeanY;
+        }
 
-        var warpedMask = new Mat();
-        Cv2.WarpAffine(mask, warpedMask, MInv, new Size(w, h), InterpolationFlags.Linear);
+        // A = dst_demean.T @ src_demean / num  (2x2)
+        double a00 = 0, a01 = 0, a10 = 0, a11 = 0;
+        for (int i = 0; i < num; i++)
+        {
+            a00 += dstDX[i] * srcDX[i]; a01 += dstDX[i] * srcDY[i];
+            a10 += dstDY[i] * srcDX[i]; a11 += dstDY[i] * srcDY[i];
+        }
+        a00 /= num; a01 /= num; a10 /= num; a11 /= num;
 
-        // Blend using mask
-        BlendWithMask(original, warped, warpedMask);
+        double det = a00 * a11 - a01 * a10;
+        double d0 = 1.0, d1 = det < 0 ? -1.0 : 1.0;
 
-        MInv.Dispose();
-        warped.Dispose();
-        mask.Dispose();
-        kernel.Dispose();
-        warpedMask.Dispose();
+        // SVD of 2x2 matrix A
+        var aMat = new Mat(2, 2, MatType.CV_64FC1);
+        aMat.Set(0, 0, a00); aMat.Set(0, 1, a01);
+        aMat.Set(1, 0, a10); aMat.Set(1, 1, a11);
+
+        var w = new Mat(); var u = new Mat(); var vt = new Mat();
+        Cv2.SVDecomp(aMat, w, u, vt);
+
+        double s0 = w.At<double>(0, 0), s1 = w.At<double>(1, 0);
+
+        // R = U @ diag(d) @ Vt
+        double u00 = u.At<double>(0, 0) * d0, u01 = u.At<double>(0, 1) * d1;
+        double u10 = u.At<double>(1, 0) * d0, u11 = u.At<double>(1, 1) * d1;
+        double vt00 = vt.At<double>(0, 0), vt01 = vt.At<double>(0, 1);
+        double vt10 = vt.At<double>(1, 0), vt11 = vt.At<double>(1, 1);
+
+        double r00 = u00 * vt00 + u01 * vt10;
+        double r01 = u00 * vt01 + u01 * vt11;
+        double r10 = u10 * vt00 + u11 * vt10;
+        double r11 = u10 * vt01 + u11 * vt11;
+
+        // scale = sum(S * d) / src_var
+        double srcVar = 0;
+        for (int i = 0; i < num; i++)
+            srcVar += srcDX[i] * srcDX[i] + srcDY[i] * srcDY[i];
+        srcVar /= num;
+        double scale = (s0 * d0 + s1 * d1) / (srcVar + 1e-8);
+
+        // t = dst_mean - scale * R @ src_mean
+        double tx = dstMeanX - scale * (r00 * srcMeanX + r01 * srcMeanY);
+        double ty = dstMeanY - scale * (r10 * srcMeanX + r11 * srcMeanY);
+
+        var M = new Mat(2, 3, MatType.CV_64FC1);
+        M.Set(0, 0, scale * r00); M.Set(0, 1, scale * r01); M.Set(0, 2, tx);
+        M.Set(1, 0, scale * r10); M.Set(1, 1, scale * r11); M.Set(1, 2, ty);
+
+        aMat.Dispose(); w.Dispose(); u.Dispose(); vt.Dispose();
+        return M;
     }
 
-    /// <summary>Paste enhanced face back with elliptical mask and smooth blending.</summary>
+    /// <summary>Estimate sharpness via Laplacian variance and map to CodeFormer fidelity.</summary>
+    public static double AssessFaceQuality(Mat faceCrop)
+    {
+        var gray = new Mat();
+        Cv2.CvtColor(faceCrop, gray, ColorConversionCodes.BGR2GRAY);
+        var laplacian = new Mat();
+        Cv2.Laplacian(gray, laplacian, MatType.CV_64FC1);
+
+        Cv2.MeanStdDev(laplacian, out _, out var stdDev);
+        double lapVar = stdDev[0] * stdDev[0];
+
+        gray.Dispose();
+        laplacian.Dispose();
+
+        if (lapVar > 200) return 0.9;
+        if (lapVar > 100) return 0.7;
+        if (lapVar > 50) return 0.5;
+        return 0.3;
+    }
+
+    /// <summary>Build adaptive face mask from 5-point landmarks via expanded convex hull.</summary>
+    public static Mat BuildLandmarkMask(float[,] kps, int height, int width, float expand = 1.8f)
+    {
+        // Center of landmarks
+        float cx = 0, cy = 0;
+        for (int i = 0; i < 5; i++) { cx += kps[i, 0]; cy += kps[i, 1]; }
+        cx /= 5; cy /= 5;
+
+        // Max distance from center
+        float maxDist = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            float dx = kps[i, 0] - cx, dy = kps[i, 1] - cy;
+            float dist = MathF.Sqrt(dx * dx + dy * dy);
+            maxDist = Math.Max(maxDist, dist);
+        }
+        float radius = maxDist * expand;
+
+        // Synthetic boundary around landmarks to form a face-shaped hull
+        var allPts = new List<Point>();
+        for (int i = 0; i < 5; i++)
+            allPts.Add(new Point((int)kps[i, 0], (int)kps[i, 1]));
+
+        for (int i = 0; i < 32; i++)
+        {
+            double angle = 2 * Math.PI * i / 32;
+            allPts.Add(new Point(
+                (int)(cx + radius * Math.Cos(angle)),
+                (int)(cy + radius * Math.Sin(angle))));
+        }
+
+        var mask = new Mat(height, width, MatType.CV_8UC1, Scalar.All(0));
+        var hull = Cv2.ConvexHull(allPts.ToArray());
+        Cv2.FillConvexPoly(mask, hull, new Scalar(255));
+
+        // Feather edges proportionally to face size
+        int ksize = Math.Max((int)(radius * 0.4f) | 1, 21);
+        Cv2.GaussianBlur(mask, mask, new Size(ksize, ksize), ksize * 0.3);
+
+        return mask;
+    }
+
+    /// <summary>Paste a face back onto the original image using inverse affine transform with elliptical blending.</summary>
     public static void PasteBackWithBlending(Mat original, Mat face, Mat M, int faceSize)
     {
         var MInv = new Mat();
@@ -94,7 +197,7 @@ public static class ImageUtils
     }
 
     /// <summary>Alpha blend source onto target using a grayscale mask (in-place on target).</summary>
-    private static void BlendWithMask(Mat target, Mat source, Mat mask)
+    public static void BlendWithMask(Mat target, Mat source, Mat mask)
     {
         int h = target.Rows, w = target.Cols;
         var tData = new byte[h * w * 3];
@@ -117,52 +220,5 @@ public static class ImageUtils
         }
 
         System.Runtime.InteropServices.Marshal.Copy(tData, 0, target.Data, tData.Length);
-    }
-
-    /// <summary>Transfer color distribution from target to source in LAB space (modifies source in-place).</summary>
-    public static void ColorTransfer(Mat source, Mat target)
-    {
-        var srcLab = new Mat();
-        var tgtLab = new Mat();
-        Cv2.CvtColor(source, srcLab, ColorConversionCodes.BGR2Lab);
-        Cv2.CvtColor(target, tgtLab, ColorConversionCodes.BGR2Lab);
-
-        var srcF = new Mat();
-        var tgtF = new Mat();
-        srcLab.ConvertTo(srcF, MatType.CV_32FC3);
-        tgtLab.ConvertTo(tgtF, MatType.CV_32FC3);
-
-        for (int ch = 0; ch < 3; ch++)
-        {
-            var srcCh = new Mat();
-            var tgtCh = new Mat();
-            Cv2.ExtractChannel(srcF, srcCh, ch);
-            Cv2.ExtractChannel(tgtF, tgtCh, ch);
-
-            Cv2.MeanStdDev(srcCh, out var srcMean, out var srcStd);
-            Cv2.MeanStdDev(tgtCh, out var tgtMean, out var tgtStd);
-
-            double sm = srcMean[0], ss = srcStd[0] + 1e-6;
-            double tm = tgtMean[0], ts = tgtStd[0] + 1e-6;
-
-            // (pixel - src_mean) * (tgt_std / src_std) + tgt_mean
-            var temp = new Mat();
-            Cv2.Subtract(srcCh, new Scalar(sm), temp);
-            Cv2.Multiply(temp, new Scalar(ts / ss), temp);
-            Cv2.Add(temp, new Scalar(tm), temp);
-            Cv2.InsertChannel(temp, srcF, ch);
-
-            srcCh.Dispose();
-            tgtCh.Dispose();
-            temp.Dispose();
-        }
-
-        srcF.ConvertTo(srcLab, MatType.CV_8UC3);
-        Cv2.CvtColor(srcLab, source, ColorConversionCodes.Lab2BGR);
-
-        srcLab.Dispose();
-        tgtLab.Dispose();
-        srcF.Dispose();
-        tgtF.Dispose();
     }
 }

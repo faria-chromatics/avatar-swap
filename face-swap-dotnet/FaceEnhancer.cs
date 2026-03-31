@@ -32,12 +32,17 @@ public class FaceEnhancer : IDisposable
     }
 
     /// <summary>
-    /// Enhance the face in the image: align → CodeFormer → color correct → blend back.
+    /// Enhance the face in the upscaled crop: Umeyama align → adaptive fidelity → CodeFormer →
+    /// inverse warp → landmark mask → Poisson blend. Returns the blended crop.
     /// </summary>
-    public void EnhanceFace(Mat image, FaceInfo face, double fidelity = 0.7)
+    public Mat EnhanceFace(Mat upscaledCrop, FaceInfo face)
     {
-        // Align face to 512x512
-        var (aligned, M) = ImageUtils.AlignFaceWithMatrix(image, face.Landmarks, 512, Template512);
+        // Umeyama alignment to 512x512
+        var (aligned, M) = ImageUtils.AlignFaceWithMatrix(upscaledCrop, face.Landmarks, 512, Template512);
+
+        // Adaptive fidelity based on sharpness
+        double fidelity = ImageUtils.AssessFaceQuality(aligned);
+        Console.WriteLine($"  Adaptive fidelity: {fidelity:F2}");
 
         // Preprocess: BGR→RGB, normalize to [-1, 1], HWC→CHW
         var blob = new float[3 * 512 * 512];
@@ -79,14 +84,82 @@ public class FaceEnhancer : IDisposable
             }
         System.Runtime.InteropServices.Marshal.Copy(enhData, 0, enhanced.Data, enhData.Length);
 
-        // Color-correct enhanced face to match original aligned crop
-        ImageUtils.ColorTransfer(enhanced, aligned);
+        // Warp enhanced face back onto upscaled crop
+        var MInv = new Mat();
+        Cv2.InvertAffineTransform(M, MInv);
+        int ucH = upscaledCrop.Rows, ucW = upscaledCrop.Cols;
+        var warpedFace = new Mat();
+        Cv2.WarpAffine(enhanced, warpedFace, MInv, new Size(ucW, ucH), InterpolationFlags.Linear);
 
-        // Paste back with elliptical blending
-        ImageUtils.PasteBackWithBlending(image, enhanced, M, 512);
+        // Landmark-based adaptive mask
+        var mask = ImageUtils.BuildLandmarkMask(face.Landmarks, ucH, ucW, expand: 1.8f);
 
+        // Poisson blending (seamlessClone) replaces naive LAB color transfer
+        var poissonMask = new Mat();
+        Cv2.Threshold(mask, poissonMask, 128, 255, ThresholdTypes.Binary);
+        poissonMask.ConvertTo(poissonMask, MatType.CV_8UC1);
+
+        var moments = Cv2.Moments(poissonMask);
+        Mat resultCrop;
+
+        if (moments.M00 > 0)
+        {
+            int cx = (int)(moments.M10 / moments.M00);
+            int cy = (int)(moments.M01 / moments.M00);
+            try
+            {
+                resultCrop = new Mat();
+                Cv2.SeamlessClone(warpedFace, upscaledCrop, poissonMask, new Point(cx, cy),
+                    resultCrop, SeamlessCloneMethods.MixedClone);
+            }
+            catch
+            {
+                Console.WriteLine("  Poisson blending failed, falling back to alpha blend");
+                resultCrop = AlphaBlendWithMask(warpedFace, upscaledCrop, mask);
+            }
+        }
+        else
+        {
+            resultCrop = AlphaBlendWithMask(warpedFace, upscaledCrop, mask);
+        }
+
+        // Cleanup
         aligned.Dispose();
+        M.Dispose();
+        MInv.Dispose();
         enhanced.Dispose();
+        warpedFace.Dispose();
+        mask.Dispose();
+        poissonMask.Dispose();
+
+        return resultCrop;
+    }
+
+    private static Mat AlphaBlendWithMask(Mat foreground, Mat background, Mat mask8u)
+    {
+        int h = background.Rows, w = background.Cols;
+        var result = new Mat(h, w, MatType.CV_8UC3);
+
+        var fgData = new byte[h * w * 3];
+        var bgData = new byte[h * w * 3];
+        var mData = new byte[h * w];
+        var outData = new byte[h * w * 3];
+
+        System.Runtime.InteropServices.Marshal.Copy(foreground.Data, fgData, 0, fgData.Length);
+        System.Runtime.InteropServices.Marshal.Copy(background.Data, bgData, 0, bgData.Length);
+        System.Runtime.InteropServices.Marshal.Copy(mask8u.Data, mData, 0, mData.Length);
+
+        for (int i = 0; i < h * w; i++)
+        {
+            float alpha = mData[i] / 255f;
+            int idx = i * 3;
+            outData[idx + 0] = (byte)(fgData[idx + 0] * alpha + bgData[idx + 0] * (1f - alpha));
+            outData[idx + 1] = (byte)(fgData[idx + 1] * alpha + bgData[idx + 1] * (1f - alpha));
+            outData[idx + 2] = (byte)(fgData[idx + 2] * alpha + bgData[idx + 2] * (1f - alpha));
+        }
+
+        System.Runtime.InteropServices.Marshal.Copy(outData, 0, result.Data, outData.Length);
+        return result;
     }
 
     public void Dispose() => _session.Dispose();
